@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+This software is in the public domain under CC0 1.0 Universal plus a
+Grant of Patent License.
+
+To the extent possible under law, the author(s) have dedicated all
+copyright and related and neighboring rights to this software to the
+public domain worldwide. This software is distributed without any
+warranty.
+
+You should have received a copy of the CC0 Public Domain Dedication
+along with this software (see the LICENSE.md file). If not, see
+<http://creativecommons.org/publicdomain/zero/1.0/>.
+-->
+<entity-facade-xml type="demo">
+    <moqui.service.message.SystemMessageRemote systemMessageRemoteId="PipedriveAPI" description="Stores the API key for pipedrive"
+            sendUrl="https://${companyName}.pipedrive.com/v1/${apiResource}?api_token=${apiKey}"
+            username="[add company name here!]" password="[add API key here!]"/>
+
+    <moqui.service.message.SystemMessageType systemMessageTypeId="PipedriveGetRecentChanges" description="Message to the Pipedrive API requesting recent changes to contacts."
+            sendServiceName="Sync.SyncServices.get#RecentChanges" contentType="text/json"/>
+    <moqui.service.message.SystemMessageType systemMessageTypeId="PipedriveGetOrganizationInfo" description="Message to the Pipedrive API requesting info on a specific organization."
+            sendServiceName="Sync.SyncServices.getAndCreate#ContactOrganization" contentType="text/json"/>
+
+    <moqui.service.job.ServiceJob jobName="sync_PipedriveContacts_hourly" description="Hourly service to pull all recent changes from Pipedrive."
+            serviceName="Sync.SyncServices.get#RecentChanges" cronExpression="0 0 * * * ?"/>
+</entity-facade-xml>

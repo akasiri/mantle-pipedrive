@@ -1,0 +1,706 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+This software is in the public domain under CC0 1.0 Universal plus a
+Grant of Patent License.
+
+To the extent possible under law, the author(s) have dedicated all
+copyright and related and neighboring rights to this software to the
+public domain worldwide. This software is distributed without any
+warranty.
+
+You should have received a copy of the CC0 Public Domain Dedication
+along with this software (see the LICENSE.md file). If not, see
+<http://creativecommons.org/publicdomain/zero/1.0/>.
+-->
+<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+          xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-2.1.xsd">
+
+    <service verb="get" noun="RecentChanges" authenticate="anonymous-all">
+        <out-parameters><parameter name="success" default-value="N"/></out-parameters>
+        <actions>
+            <!-- used later on in service to translate Timestamp to Pipedrive's date format -->
+            <script><![CDATA[
+                    import java.time.ZoneId
+                    import java.time.ZonedDateTime
+                    import java.time.format.DateTimeFormatter
+            ]]></script>
+
+            <set field="serviceStartTime" from="ec.user.getNowTimestamp()"/>
+            <log level="info" message="Starting sync of pipedrive contacts... (Sync.SyncServices.get#RecentChanges) +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++"/>
+
+            <entity-find-one entity-name="moqui.service.message.SystemMessageRemote" value-field="pipedriveApiInfo" auto-field-map="[systemMessageRemoteId: 'PipedriveAPI']"/>
+            <if condition="!pipedriveApiInfo">
+                <return error="true" message="Unable to find a SystemMessageRemote with the specified ID (${systemMessageRemoteId}) that stores the URL and API key for a pipedrive instance"/>
+            </if>
+            <set field="apiKey" from="pipedriveApiInfo.password"/>
+            <set field="companyName" from="pipedriveApiInfo.username"/>
+
+            <entity-find entity-name="moqui.service.message.SystemMessage" list="lastSyncMessage">
+                <econdition field-name="systemMessageTypeId" operator="equals" value="PipedriveGetRecentChanges"/>
+                <econdition field-name="statusId" operator="equals" value="SmsgReceived"/>
+                <order-by field-name="-initDate"/>
+                <limit-range start="0" size="1"/>
+            </entity-find>
+            <if condition="lastSyncMessage?.size() > 0"><then>
+                <!-- Assuming that the initDates are stored in the same timezone as when we are trying to load them in -->
+                <script><![CDATA[
+                    lastFetchDate_InLocalTimeZone = ZonedDateTime.of(lastSyncMessage[0].initDate.toLocalDateTime(), ZoneId.systemDefault())
+                    lastFetchDate_InUTC = lastFetchDate_InLocalTimeZone.withZoneSameInstant(ZoneId.of('UTC')) // convert from Moqui's timezone to UTC, what pipedrive uses
+
+                    PipedriveStyleFormatter = DateTimeFormatter.ofPattern('yyyy-MM-dd%20HH:mm:ss')
+                ]]></script>
+                <set field="lastFetched" from="PipedriveStyleFormatter.format(lastFetchDate_InUTC)"/>
+            </then><else>
+                <set field="lastFetched" value="1000-01-01%2000:00:00"/> <!-- I think it is fair to assume no one using this service will have changes from before 1 Jan 1000 -->
+            </else></if>
+
+            <log level="info" message="Fetching all changes made after ${lastFetched.replaceAll('%20', ' ')}[UTC]... (Sync.SyncServices.get#RecentChanges)"/>
+
+            <set field="apiResource" value="recents"/>
+            <set field="step" from="100"/>
+            <set field="start" from="0 - step"/>
+
+            <set field="itemCount" from="0"/>
+            <!-- treating this as a do-while loop. condition is checked at the end of the loop -->
+            <while condition="true">
+                <set field="start" from="start + step"/>
+
+                <set field="templateUrl" from="pipedriveApiInfo.sendUrl + '&amp;since_timestamp=${lastFetched}&amp;start=${start}&amp;limit=${step}'"/>
+                <set field="urlBinding" from="[
+                        companyName:companyName,
+                        apiKey:apiKey,
+                        apiResource:apiResource,
+                        lastFetched:lastFetched,
+                        start:start,
+                        step:step]"/>
+                <set field="url" from="new groovy.text.SimpleTemplateEngine().createTemplate(templateUrl).make(urlBinding).toString()"/>
+
+                <set field="responseMap" from="new org.moqui.util.RestClient().uri(url).method('GET').call().jsonObject()"/>
+
+                <if condition="responseMap.success"><then>
+                    <iterate list="responseMap.data" entry="item">
+                        <if condition="item.item == 'person'">
+                            <log message="item from pipedrive= ${item.item} ${item.id}"/>
+                            <set field="itemCount" from="itemCount + 1"/>
+                            <service-call name="Sync.SyncServices.sync#Person" in-map="context" out-map="context"/>
+                        </if>
+                        <if condition="item.item == 'organization'">
+                            <log message="item from pipedrive= ${item.item} ${item.id}"/>
+                            <set field="itemCount" from="itemCount + 1"/>
+                            <service-call name="Sync.SyncServices.sync#Organization" in-map="context" out-map="context"/>
+                        </if>
+                    </iterate>
+                </then><else>
+                    <service-call name="create#moqui.service.message.SystemMessage" out-map="context" in-map="[
+                    systemMessageRemoteId:pipedriveApiInfo.systemMessageRemoteId,
+                    systemMessageTypeId:'PipedriveGetRecentChanges',
+                    isOutgoing:'N',
+                    statusId:'SmsgError',
+                    initDate:serviceStartTime,
+                    messageText:responseMap.toString()]"/>
+
+                    <return error="true" message="Error while trying to sync with Pipedrive. ${responseMap.error ? 'Error message: &quot;' + responseMap.error + '&quot;' : ''}"/>
+                </else></if>
+
+                <if condition="!responseMap.additional_data.pagination.more_items_in_collection"><break/></if>
+            </while>
+
+            <set field="success" value="Y"/>
+            <log level="info" message="Finished syncing ${itemCount} items of pipedrive contacts! (Sync.SyncServices.get#RecentChanges)"/>
+
+            <service-call name="create#moqui.service.message.SystemMessage" out-map="context" in-map="[
+                    systemMessageRemoteId:pipedriveApiInfo.systemMessageRemoteId,
+                    systemMessageTypeId:'PipedriveGetRecentChanges',
+                    isOutgoing:'N',
+                    statusId:'SmsgReceived',
+                    initDate:serviceStartTime,
+                    messageText:responseMap.toString()]"/>
+        </actions>
+    </service>
+
+    <!--
+    see if the record already exists. if so, decide which version to keep. decide whether to call create# or update#
+    -->
+    <service verb="sync" noun="Person">
+        <in-parameters>
+            <parameter name="item" type="Map" required="true"/>
+        </in-parameters>
+        <actions>
+            <set field="personInfo" from="item.data"/>
+<!--            <log message="\n${groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(personInfo))}"/>-->
+
+            <set field="partyId" from="'pd_p_' + personInfo.id.toString()"/>
+            <entity-find-one entity-name="mantle.party.Party" value-field="party"/>
+
+            <if condition="party"><then>
+                <service-call name="Sync.SyncServices.update#ContactPerson" in-map="context + [oldParty: party]" out-map="context"/>
+            </then><else>
+                <service-call name="Sync.SyncServices.create#ContactPerson" in-map="context" out-map="context"/>
+            </else></if>
+        </actions>
+    </service>
+    <service verb="sync" noun="Organization">
+        <in-parameters>
+            <parameter name="item" type="Map" required="true"/>
+        </in-parameters>
+        <actions>
+            <set field="orgInfo" from="item.data"/>
+
+            <set field="partyId" from="'pd_o_' + orgInfo.id.toString()"/>
+            <entity-find-one entity-name="mantle.party.Party" value-field="party"/>
+
+            <if condition="party"><then>
+                <service-call name="Sync.SyncServices.update#ContactOrganization" in-map="context + [oldParty: party]" out-map="context"/>
+            </then><else>
+                <service-call name="Sync.SyncServices.create#ContactOrganization" in-map="context" out-map="context"/>
+            </else></if>
+        </actions>
+    </service>
+
+    <!--
+    gather up the attributes
+    pull and create an necessary relations
+    create the target record
+    -->
+    <service verb="create" noun="ContactPerson">
+        <in-parameters>
+            <parameter name="personInfo" type="Map" required="true"/>
+        </in-parameters>
+        <out-parameters><parameter name="personPartyId"/></out-parameters>
+        <actions>
+            <set field="partyId" from="'pd_p_' + personInfo.id.toString()"/>
+            <set field="firstName" from="personInfo.first_name ?: '_NA_'"/>
+            <set field="lastName" from="personInfo.last_name ?: '_NA_'"/>
+            <set field="comments" value="A contact person synced from Pipedrive. Pipedrive source: ${companyName}.pipedrive.com"/>
+            <set field="roleTypeId" value="Contact"/>
+
+            <service-call name="mantle.party.PartyServices.create#Person" in-map="context" out-map="context"/>
+            <set field="comments" from="null"/> <!-- resetting comments so it doesn't affect any other entities being created -->
+
+            <if condition="personInfo.org_id">
+                <entity-find-one entity-name="mantle.party.Party" value-field="orgParty" auto-field-map="[partyId:'pd_o_' + personInfo.org_id.value.toString()]"/>
+
+                <if condition="!orgParty">
+                    <!-- If the org is not currently in Moqui's database, get the org's info and create a record for the org -->
+                    <service-call name="Sync.SyncServices.getAndCreate#ContactOrganization" in-map="context + [pipedriveOrgId:personInfo.org_id.value.toString()]"/>
+                </if>
+
+                <!-- link organization to this person -->
+                <set field="fromPartyId" from="partyId"/>
+                <set field="toPartyId" from="'pd_o_' + personInfo.org_id.value.toString()"/>
+                <service-call name="Sync.SyncServices.create#PersonToOrganizationRelationship" in-map="context" out-map="context"/>
+            </if>
+            <if condition="personInfo.phone">
+                <iterate list="personInfo.phone" entry="phone">
+                    <if condition="phone.value != ''">
+                        <set field="contactNumber" from="phone.value"/>
+
+                        <if condition="phone.primary"><then>
+                            <set field="contactMechPurposeId" value="PhonePrimary"/>
+                        </then><else-if condition="phone.label == 'work'">
+                            <set field="contactMechPurposeId" value="PhoneWork"/>
+                        </else-if><else-if condition="phone.label == 'home'">
+                            <set field="contactMechPurposeId" value="PhoneHome"/>
+                        </else-if><else-if condition="phone.label == 'mobile'">
+                            <set field="contactMechPurposeId" value="PhoneMobile"/>
+                        </else-if><else>
+                            <set field="contactMechPurposeId" value="PhoneMobile"/>
+                        </else></if>
+
+                        <service-call name="Sync.SyncServices.create#NonValidatingTelecomNumber" in-map="context" />
+                    </if>
+                </iterate>
+            </if>
+            <if condition="personInfo.email">
+                <iterate list="personInfo.email" entry="email">
+                    <if condition="email.value != ''">
+                        <set field="emailAddress" from="email.value"/>
+                        <set field="contactMechTypeEnumId" value="CmtEmailAddress"/>
+                        <if condition="email.primary"><then>
+                            <set field="contactMechPurposeId" value="EmailPrimary"/>
+                        </then><else>
+                            <set field="contactMechPurposeId" value="EmailOther"/>
+                        </else></if>
+
+                        <service-call name="Sync.SyncServices.create#NonValidatingEmailAddress" in-map="context" out-map="context"/>
+                        <set field="contactMechId" from="null"/> <!-- reset contactMechId before the next iteration (otherwise will try to create a ContactMech with the same id) -->
+                    </if>
+                </iterate>
+            </if>
+
+            <service-call name="Sync.SyncCustomFieldsServices.create#ContactPersonCustomFields" in-map="context" out-map="context"/>
+            <set field="personPartyId" from="partyId"/>
+        </actions>
+    </service>
+    <service verb="create" noun="ContactOrganization">
+        <in-parameters>
+
+
+            <parameter name="orgInfo" type="Map" required="true"/>
+        </in-parameters>
+        <out-parameters><parameter name="orgPartyId"/></out-parameters>
+        <actions>
+            <set field="partyId" from="'pd_o_' + orgInfo.id.toString()"/>
+            <set field="organizationName" from="orgInfo.name"/>
+            <set field="comments" value="A contact organization synced from Pipedrive. Pipedrive source: ${companyName}.pipedrive.com"/>
+            <set field="roleTypeId" value="Contact"/>
+
+            <service-call name="mantle.party.PartyServices.create#Organization" in-map="context" out-map="context"/>
+            <set field="comments" from="null"/> <!-- resetting comments so it doesn't affect any other entities being created -->
+
+            <if condition="orgInfo.address">
+                <set field="contactMechPurposeId" value="PostalPrimary"/>
+                <if condition="orgInfo.address_street_number &amp;&amp; orgInfo.address_route"><set field="address1" from="orgInfo.address_street_number + ' ' + orgInfo.address_route"/></if>
+                <if condition="orgInfo.address_locality"><set field="city" from="orgInfo.address_locality"/></if>
+                <if condition="orgInfo.address_admin_area_level_1"><set field="state" from="orgInfo.address_admin_area_level_1"/></if> <!-- todo: iterate over all geo id's in moqui and compare pipedrive state / country to geoid.description to find the corresponding ids -->
+                <if condition="orgInfo.address_country"><set field="country" from="orgInfo.address_country"/></if>
+                <if condition="orgInfo.address_postal_code"><set field="postalCode" from="orgInfo.address_postal_code"/></if>
+                <service-call name="mantle.party.ContactServices.create#PostalAddress" in-map="context" out-map="context"/>
+            </if>
+
+            <service-call name="Sync.SyncCustomFieldsServices.create#ContactOrganizationCustomFields" in-map="context" out-map="context"/>
+            <set field="orgPartyId" from="partyId"/>
+        </actions>
+    </service>
+    <service verb="getAndCreate" noun="ContactOrganization">
+        <!-- this service is a wrapper for create#ContactOrganization.
+        it creates a contact organization when you don't have orgInfo, but do have a pipedrive id
+        -->
+        <in-parameters>
+            <parameter name="pipedriveOrgId" required="true"/>
+        </in-parameters>
+        <out-parameters><parameter name="orgPartyId"/></out-parameters>
+        <actions>
+            <entity-find-one entity-name="moqui.service.message.SystemMessageRemote" value-field="pipedriveApiInfo" auto-field-map="[systemMessageRemoteId:'PipedriveAPI']"/>
+            <if condition="!pipedriveApiInfo">
+                <return error="true" message="Unable to find the PipedriveAPI SystemMessageRemote that stores the URL and API key"/>
+            </if>
+            <set field="apiKey" from="pipedriveApiInfo.password"/>
+            <set field="companyName" from="pipedriveApiInfo.username"/>
+
+            <set field="apiResource" value="organizations/${pipedriveOrgId}"/>
+
+            <set field="templateUrl" from="pipedriveApiInfo.sendUrl"/>
+            <set field="urlBinding" from="[
+                        companyName:companyName,
+                        apiKey:apiKey,
+                        apiResource:apiResource]"/>
+            <set field="url" from="new groovy.text.SimpleTemplateEngine().createTemplate(templateUrl).make(urlBinding).toString()"/>
+
+            <set field="orgResponseMap" from="new org.moqui.util.RestClient().uri(url).method('GET').call().jsonObject()"/>
+
+            <if condition="orgResponseMap.success"><then>
+                <service-call name="Sync.SyncServices.create#ContactOrganization" in-map="context + [orgInfo:orgResponseMap.data]" out-map="context"/>
+            </then><else>
+                <log level="error" message="API error while trying to get contact organization ('pd_o_' + ${pipedriveOrgId}) in Sync.SyncServices.getAndCreate#Organization. Not rollingback, continuing with previous operation."/>
+            </else></if>
+        </actions>
+    </service>
+
+    <!--
+    really more of a replace than an update
+    -->
+    <service verb="update" noun="ContactPerson">
+        <in-parameters>
+
+
+            <parameter name="personInfo" type="Map" required="true"/>
+            <parameter name="oldParty" type="Map" required="true"/>
+        </in-parameters>
+        <out-parameters><parameter name="personPartyId"/></out-parameters>
+        <actions>
+            <set field="partyId" from="'pd_p_' + personInfo.id.toString()"/>
+            <set field="firstName" from="personInfo.first_name ?: '_NA_'"/>
+            <set field="lastName" from="personInfo.last_name ?: '_NA_'"/>
+            <set field="comments" value="A contact person synced from Pipedrive. Pipedrive source: ${companyName}.pipedrive.com"/>
+            <set field="roleTypeId" value="Contact"/>
+
+            <service-call name="mantle.party.PartyServices.update#PartyDetail" in-map="context" out-map="context"/>
+            <set field="comments" from="null"/> <!-- resetting comments so it doesn't affect any other entities being created -->
+
+            <if condition="personInfo.org_id"><then>
+                <entity-find entity-name="mantle.party.PartyRelationship" list="relatedOrganizations">
+                    <econdition field-name="fromPartyId" operator="equals" from="partyId"/>
+                    <econdition field-name="toPartyId" operator="like" value="pd_o_%"/>
+                    <econdition field-name="thruDate" operator="greater-equals" from="ec.user.getNowTimestamp()" or-null="true"/>
+                </entity-find>
+
+                <if condition="relatedOrganizations.size() == 1"><then>
+                    <set field="organizationInDB" from="relatedOrganizations[0].toParty.organization"/>
+                    <if condition="'pd_o_' + personInfo.org_id.value.toString() != organizationInDB.partyId"><then>
+                        <!-- person has changed organizations -->
+
+                        <!-- expire old org -->
+                        <service-call name="Sync.SyncServices.expire#PersonToOrganizationRelationship"
+                                      in-map="[partyRelationshipId:relatedOrganizations[0].partyRelationshipId]"/>
+
+                        <!-- If org not already in database, add it -->
+                        <entity-find-one entity-name="mantle.party.Party" value-field="orgParty">
+                            <field-map field-name="partyId" from="'pd_o_' + personInfo.org_id.value.toString()"/></entity-find-one>
+                        <if condition="!orgParty"><then>
+                            <service-call name="Sync.SyncServices.getAndCreate#ContactOrganization" in-map="context + [pipedriveOrgId:personInfo.org_id.value.toString()]" out-map="context"/> <!-- adds orgPartyId to the context -->
+                        </then><else>
+                            <set field="orgPartyId" from="orgParty.partyId"/>
+                        </else></if>
+
+                        <!-- link the person to the org -->
+                        <service-call name="Sync.SyncServices.create#PersonToOrganizationRelationship"
+                                      in-map="[fromPartyId:partyId, toPartyId:orgPartyId]"/>
+                    </then><else>
+                        <!-- person has not changed organizations. carry on with no action. -->
+                    </else></if>
+                </then><else>
+                    <!-- person is not currently connected to any organizations -->
+
+                    <!-- If org not already in database, add it -->
+                    <entity-find-one entity-name="mantle.party.Party" value-field="orgParty">
+                        <field-map field-name="partyId" from="'pd_o_' + personInfo.org_id.value.toString()"/></entity-find-one>
+                    <if condition="!orgParty"><then>
+                        <service-call name="Sync.SyncServices.getAndCreate#ContactOrganization" in-map="context + [pipedriveOrgId:personInfo.org_id.value.toString()]" out-map="context"/> <!-- adds orgPartyId to the context -->
+                    </then><else>
+                        <set field="orgPartyId" from="orgParty.partyId"/>
+                    </else></if>
+
+                    <!-- link the person to the org -->
+                    <service-call name="Sync.SyncServices.create#PersonToOrganizationRelationship"
+                                  in-map="[fromPartyId:partyId, toPartyId:orgPartyId]"/>
+                </else></if>
+            </then><else>
+                <!-- person no longer linked to an org in pipedrive, but may still be in moqui's database. if so, expire the relationship -->
+                <entity-find entity-name="mantle.party.PartyRelationship" list="relatedOrganizations">
+                    <econdition field-name="fromPartyId" operator="equals" from="partyId"/>
+                    <econdition field-name="toPartyId" operator="like" value="pd_o_%"/>
+                    <econdition field-name="thruDate" operator="greater-equals" from="ec.user.getNowTimestamp()" or-null="true"/>
+                </entity-find>
+
+                <if condition="relatedOrganizations.size() == 1">
+                    <service-call name="Sync.SyncServices.expire#PersonToOrganizationRelationship"
+                                  in-map="[partyRelationshipId:relatedOrganizations[0].partyRelationshipId]"/>
+                </if>
+            </else></if>
+            <if condition="personInfo.phone">
+                <entity-find entity-name="mantle.party.contact.PartyContactMech" list="telecomPartyContactMechs">
+                    <econdition field-name="partyId" operator="equals" from="partyId"/>
+                    <econdition field-name="contactMechPurposeId" operator="like" value="Phone%"/>
+                    <econdition field-name="thruDate" operator="greater-equals" from="ec.user.getNowTimestamp()" or-null="true"/>
+                </entity-find>
+<!--<log message="### CONTEXT DUMP ###\ntelecomPartyContactMechs=${groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(telecomPartyContactMechs))}"/>-->
+
+                <iterate list="personInfo.phone" entry="phoneFromPipedrive">
+<!--<log message="### CONTEXT DUMP ###\ntelecomPartyContactMechs=${groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(telecomPartyContactMechs))}\nindex=${index}\nphoneFromPipedrive=${phoneFromPipedrive}"/>-->
+
+                    <if condition="phoneFromPipedrive.value != ''">
+                        <set field="index" from="0"/>
+                        <set field="isNew" from="true"/>
+                        <iterate list="telecomPartyContactMechs" entry="telecomPartyContactMech">
+                            <set field="phoneInDB" from="telecomPartyContactMech.contactMech.telecomNumber"/>
+
+                            <if condition="phoneFromPipedrive.value == phoneInDB.contactNumber">
+                                <set field="contactMechId" from="telecomPartyContactMech.contactMechId"/>
+                                <set field="contactNumber" from="phoneFromPipedrive.value"/>
+
+                                <!-- check to see if label or primary status has changed. if so, update the related records -->
+                                <if condition="phoneFromPipedrive.primary"><then>
+                                    <if condition="telecomPartyContactMech.contactMechPurposeId != 'PhonePrimary'">
+                                        <set field="contactMechPurposeId" value="PhonePrimary"/>
+                                        <service-call name="Sync.SyncServices.update#NonValidatingTelecomNumber" in-map="context"/>
+                                    </if>
+                                </then><else-if condition="phoneFromPipedrive.label == 'work'">
+                                    <if condition="telecomPartyContactMech.contactMechPurposeId != 'PhoneWork'">
+                                        <set field="contactMechPurposeId" value="PhoneWork"/>
+                                        <service-call name="Sync.SyncServices.update#NonValidatingTelecomNumber" in-map="context"/>
+                                    </if>
+                                </else-if><else-if condition="phoneFromPipedrive.label == 'home'">
+                                    <if condition="telecomPartyContactMech.contactMechPurposeId != 'PhoneHome'">
+                                        <set field="contactMechPurposeId" value="PhoneHome"/>
+                                        <service-call name="Sync.SyncServices.update#NonValidatingTelecomNumber" in-map="context"/>
+                                    </if>
+                                </else-if><else-if condition="phoneFromPipedrive.label == 'mobile'">
+                                    <if condition="telecomPartyContactMech.contactMechPurposeId != 'PhoneMobile'">
+                                        <set field="contactMechPurposeId" value="PhoneMobile"/>
+                                        <service-call name="Sync.SyncServices.update#NonValidatingTelecomNumber" in-map="context"/>
+                                    </if>
+                                </else-if><else>
+                                    <if condition="telecomPartyContactMech.contactMechPurposeId != 'PhoneMobile'">
+                                        <set field="contactMechPurposeId" value="PhoneMobile"/>
+                                        <service-call name="Sync.SyncServices.update#NonValidatingTelecomNumber" in-map="context"/>
+                                    </if>
+                                </else></if>
+
+                                <script>telecomPartyContactMechs.remove(index)</script> <!-- remove telecomNumbers that have been accounted for. those left over will be deleted. I am done with the loop so there is no issue of messing with the iteration by removing a value. -->
+                                <set field="isNew" from="false"/>
+                                <break/>
+                            </if>
+
+                            <set field="index" from="index+1"/>
+                        </iterate>
+
+                        <if condition="isNew">
+                            <set field="contactNumber" from="phoneFromPipedrive.value"/>
+                            <set field="contactMechTypeEnumId" value="CmtTelecomNumber"/>
+
+                            <if condition="phoneFromPipedrive.primary"><then>
+                                <set field="contactMechPurposeId" value="PhonePrimary"/>
+                            </then><else-if condition="phoneFromPipedrive.label == 'work'">
+                                <set field="contactMechPurposeId" value="PhoneWork"/>
+                            </else-if><else-if condition="phoneFromPipedrive.label == 'home'">
+                                <set field="contactMechPurposeId" value="PhoneHome"/>
+                            </else-if><else-if condition="phoneFromPipedrive.label == 'mobile'">
+                                <set field="contactMechPurposeId" value="PhoneMobile"/>
+                            </else-if><else>
+                                <set field="contactMechPurposeId" value="PhoneMobile"/>
+                            </else></if>
+
+                            <service-call name="Sync.SyncServices.create#NonValidatingTelecomNumber" in-map="context"/>
+                        </if>
+                    </if>
+                </iterate>
+                <!-- All still in-use phones have been removed from the telecomPartyContactMechs list. Any left
+                     over have been deleted from Pipedrive and need to be expired on Moqui -->
+                <if condition="telecomPartyContactMechs.size() != 0">
+                    <iterate list="telecomPartyContactMechs" entry="toDelete">
+                        <service-call name="mantle.party.ContactServices.delete#PartyContactMech" in-map="toDelete"/>
+                    </iterate>
+                </if>
+            </if>
+            <if condition="personInfo.email">
+                <entity-find entity-name="mantle.party.contact.PartyContactMech" list="emailPartyContactMechs">
+                    <econdition field-name="partyId" operator="equals" from="partyId"/>
+                    <econdition field-name="contactMechPurposeId" operator="like" value="Email%"/>
+                    <econdition field-name="thruDate" operator="greater-equals" from="ec.user.getNowTimestamp()" or-null="true"/>
+                </entity-find>
+<!--<log message="### CONTEXT DUMP ###\nemailPartyContactMechs=${groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(emailPartyContactMechs))}"/>-->
+
+                <iterate list="personInfo.email" entry="emailFromPipedrive">
+<!--<log message="### CONTEXT DUMP ###\nemailPartyContactMechs=${groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(emailPartyContactMechs))}\nindex=${index}\nemailFromPipedrive=${emailFromPipedrive}"/>-->
+
+                    <if condition="emailFromPipedrive.value != ''">
+                        <set field="index" from="0"/>
+                        <set field="isNew" from="true"/>
+                        <iterate list="emailPartyContactMechs" entry="emailPartyContactMech">
+                            <set field="emailInDB" from="emailPartyContactMech.contactMech"/>
+
+                            <if condition="emailFromPipedrive.value == emailInDB.infoString">
+                                <set field="contactMechId" from="emailPartyContactMech.contactMechId"/>
+                                <set field="emailAddress" from="emailFromPipedrive.value"/>
+                                <set field="contactMechTypeEnumId" value="CmtEmailAddress"/>
+
+                                <!-- check to see if label or primary status has changed. if so, update the related records -->
+                                <if condition="emailFromPipedrive.primary"><then>
+                                    <set field="contactMechPurposeId" value="EmailPrimary"/>
+                                    <service-call name="Sync.SyncServices.update#NonValidatingEmailAddress" in-map="context"/>
+                                </then><else>
+                                    <set field="contactMechPurposeId" value="EmailOther"/>
+                                    <service-call name="Sync.SyncServices.update#NonValidatingEmailAddress" in-map="context"/>
+                                </else></if>
+
+                                <script>emailPartyContactMechs.remove(index)</script> <!-- remove telecomNumbers that have been accounted for. those left over will be deleted. I am done with the loop so there is no issue of messing with the iteration by removing a value. -->
+                                <set field="isNew" from="false"/>
+                                <break/>
+                            </if>
+
+                            <set field="index" from="index+1"/>
+                        </iterate>
+
+                        <if condition="isNew">
+                            <set field="emailAddress" from="emailFromPipedrive.value"/>
+                            <set field="contactMechTypeEnumId" value="CmtEmailAddress"/>
+
+                            <if condition="emailFromPipedrive.primary"><then>
+                                <set field="contactMechPurposeId" value="EmailPrimary"/>
+                            </then><else>
+                                <set field="contactMechPurposeId" value="EmailOther"/>
+                            </else></if>
+
+                            <service-call name="Sync.SyncServices.create#NonValidatingEmailAddress" in-map="context"/>
+                        </if>
+                    </if>
+                </iterate>
+                <!-- All still in-use emails have been removed from the emailPartyContactMechs list. Any left
+                     over have been deleted from Pipedrive and need to be expired on Moqui -->
+                <if condition="emailPartyContactMechs.size() != 0">
+                    <iterate list="emailPartyContactMechs" entry="toDelete">
+                        <service-call name="mantle.party.ContactServices.delete#PartyContactMech" in-map="toDelete"/>
+                    </iterate>
+                </if>
+            </if>
+
+            <service-call name="Sync.SyncCustomFieldsServices.update#ContactPersonCustomFields" in-map="context" out-map="context"/>
+            <set field="personPartyId" from="partyId"/>
+        </actions>
+    </service>
+    <service verb="update" noun="ContactOrganization">
+        <in-parameters>
+
+
+            <parameter name="orgInfo" type="Map" required="true"/>
+            <parameter name="oldParty" type="Map" required="true"/>
+        </in-parameters>
+        <out-parameters><parameter name="orgPartyId"/></out-parameters>
+        <actions>
+            <set field="partyId" from="'pd_o_' + orgInfo.id.toString()"/>
+            <set field="organizationName" from="orgInfo.name"/>
+            <set field="comments" value="A contact organization synced from Pipedrive. Pipedrive source: ${companyName}.pipedrive.com"/>
+            <set field="roleTypeId" value="Contact"/>
+
+            <service-call name="mantle.party.PartyServices.update#PartyDetail" in-map="context" out-map="context"/>
+            <set field="comments" from="null"/> <!-- resetting comments so it doesn't affect any other entities being created -->
+
+            <if condition="orgInfo.address"><then>
+                <set field="contactMechPurposeId" value="PostalPrimary"/>
+                <if condition="orgInfo.address_street_number &amp;&amp; orgInfo.address_route"><set field="address1" from="orgInfo.address_street_number + ' ' + orgInfo.address_route"/></if>
+                <if condition="orgInfo.address_locality"><set field="city" from="orgInfo.address_locality"/></if>
+                <if condition="orgInfo.address_admin_area_level_1"><set field="state" from="orgInfo.address_admin_area_level_1"/></if> <!-- todo: iterate over all geo id's in moqui and compare pipedrive state / country to geoid.description to find the corresponding ids -->
+                <if condition="orgInfo.address_country"><set field="country" from="orgInfo.address_country"/></if>
+                <if condition="orgInfo.address_postal_code"><set field="postalCode" from="orgInfo.address_postal_code"/></if>
+
+                <entity-find entity-name="mantle.party.contact.PartyContactMech" list="postalPartyContactMechs">
+                    <econdition field-name="partyId" operator="equals" from="partyId"/>
+                    <econdition field-name="contactMechPurposeId" operator="like" value="Postal%"/>
+                    <econdition field-name="thruDate" operator="greater-equals" from="ec.user.getNowTimestamp()" or-null="true"/>
+                </entity-find>
+
+                <if condition="postalPartyContactMechs.size() == 1"><then>
+                    <!-- update existing record of postal address -->
+                    <service-call name="mantle.party.ContactServices.update#PartyPostalAddress"
+                                  in-map="context + [contactMechId:postalPartyContactMechs[0].contactMechId]"/>
+                </then><else>
+                    <!-- create a new record of postal address -->
+                    <service-call name="mantle.party.ContactServices.create#PostalAddress" in-map="context"/>
+                </else></if>
+            </then><else>
+                <entity-find entity-name="mantle.party.contact.PartyContactMech" list="postalPartyContactMechs">
+                    <econdition field-name="partyId" operator="equals" from="partyId"/>
+                    <econdition field-name="contactMechPurposeId" operator="like" value="Postal%"/>
+                    <econdition field-name="thruDate" operator="greater-equals" from="ec.user.getNowTimestamp()" or-null="true"/>
+                </entity-find>
+
+                <if condition="postalPartyContactMechs.size() == 1">
+                    <!-- org no longer linked to a postal address in pipedrive, but still has an un-expired relationship to one in moqui. expire the relationship -->
+                    <service-call name="mantle.party.ContactServices.delete#PartyContactMech" in-map="postalPartyContactMechs[0]"/>
+                </if>
+            </else></if>
+
+            <service-call name="Sync.SyncCustomFieldsServices.update#ContactOrganizationCustomFields" in-map="context" out-map="context"/>
+            <set field="orgPartyId" from="partyId"/>
+        </actions>
+    </service>
+
+    <!--
+    Sync uses these services to make the records from scratch because the mantle-usl services
+    enforce validation, while the Pipedrive data is not validated
+
+    todo: should I use <entity-create> instead of calling the create# services?
+    -->
+    <service verb="create" noun="NonValidatingTelecomNumber">
+        <in-parameters>
+            <auto-parameters entity-name="mantle.party.contact.TelecomNumber" include="nonpk"/>
+            <auto-parameters entity-name="mantle.party.contact.PartyContactMech" include="nonpk"/>
+
+            <parameter name="partyId"/>
+            <parameter name="facilityId"/>
+            <parameter name="contactMechPurposeId"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="contactMechId" required="true"/>
+        </out-parameters>
+        <actions>
+            <set field="contactMechTypeEnumId" value="CmtTelecomNumber"/>
+            <set field="trustLevelEnumId" value="CmtlNew"/>
+
+            <service-call name="create#mantle.party.contact.ContactMech" in-map="context" out-map="context"/>
+            <service-call name="create#mantle.party.contact.TelecomNumber" in-map="context" out-map="context"/> <!-- todo: pipedrive probably allows phone numbers longer than the text-short that moqui expects. will throw errors on unnaturally long phone numbers -->
+            <if condition="partyId &amp;&amp; contactMechPurposeId">
+                <service-call name="create#mantle.party.contact.PartyContactMech" in-map="context" out-map="context"/></if>
+        </actions>
+    </service>
+    <service verb="create" noun="NonValidatingEmailAddress">
+        <in-parameters>
+            <parameter name="emailAddress" required="true"/>
+            <auto-parameters entity-name="mantle.party.contact.PartyContactMech" include="nonpk"/>
+
+            <parameter name="partyId"/>
+            <parameter name="facilityId"/>
+            <parameter name="contactMechPurposeId"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="contactMechId" required="true"/>
+        </out-parameters>
+        <actions>
+            <service-call name="mantle.party.ContactServices.create#ContactMechOther" out-map="context"
+                          in-map="context + [infoString:emailAddress, contactMechTypeEnumId:'CmtEmailAddress']"/>
+        </actions>
+    </service>
+    <service verb="update" noun="NonValidatingTelecomNumber">
+        <in-parameters>
+            <auto-parameters entity-name="mantle.party.contact.TelecomNumber" include="nonpk"/>
+            <auto-parameters entity-name="mantle.party.contact.PartyContactMech" include="nonpk"/>
+
+            <parameter name="contactMechId" required="true"/>
+            <parameter name="partyId" required="true"/>
+            <parameter name="facilityId"/>
+            <parameter name="contactMechPurposeId"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="contactMechId" required="true"/>
+        </out-parameters>
+        <actions>
+            <!-- EXPIRE -->
+            <service-call name="mantle.party.ContactServices.delete#PartyContactMech" in-map="[partyId:partyId, contactMechId:contactMechId]"/>
+            <set field="contactMechId" from="null"/> <!-- reset contactMechId before the next iteration (otherwise will try to create a ContactMech with the same id) -->
+
+            <!-- MAKE NEW -->
+            <set field="contactMechTypeEnumId" value="CmtTelecomNumber"/>
+            <set field="trustLevelEnumId" value="CmtlNew"/>
+
+            <service-call name="create#mantle.party.contact.ContactMech" in-map="context" out-map="context"/>
+            <service-call name="create#mantle.party.contact.TelecomNumber" in-map="context" out-map="context"/> <!-- todo: pipedrive probably allows phone numbers longer than the text-short that moqui expects. will throw errors on unnaturally long phone numbers -->
+            <if condition="partyId &amp;&amp; contactMechPurposeId">
+                <service-call name="create#mantle.party.contact.PartyContactMech" in-map="context" out-map="context"/></if>
+        </actions>
+    </service>
+    <service verb="update" noun="NonValidatingEmailAddress">
+        <in-parameters>
+            <parameter name="emailAddress" required="true"/>
+            <auto-parameters entity-name="mantle.party.contact.PartyContactMech" include="nonpk"/>
+
+            <parameter name="contactMechId" required="true"/>
+            <parameter name="partyId"/>
+            <parameter name="facilityId"/>
+            <parameter name="contactMechPurposeId"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="contactMechId" required="true"/>
+        </out-parameters>
+        <actions>
+            <service-call name="mantle.party.ContactServices.update#PartyContactOther" out-map="context"
+                          in-map="context + [infoString:emailAddress, contactMechTypeEnumId:'CmtEmailAddress']"/>
+        </actions>
+    </service>
+
+    <service verb="create" noun="PersonToOrganizationRelationship">
+        <in-parameters>
+            <parameter name="fromPartyId" required="true"/>
+            <parameter name="toPartyId" required="true"/>
+        </in-parameters>
+        <out-parameters><parameter name="partyRelationshipId"/></out-parameters>
+        <actions>
+            <set field="fromDate" from="ec.user.getNowTimestamp()"/>
+            <set field="fromRoleTypeId" value="Employee"/>
+            <set field="toRoleTypeId" value="OrgEmployer"/>
+            <set field="relationshipTypeEnumId" value="PrtEmployee"/>
+
+            <service-call name="create#mantle.party.PartyRelationship" in-map="context" out-map="context"/>
+        </actions>
+    </service>
+    <service verb="expire" noun="PersonToOrganizationRelationship">
+        <in-parameters>
+            <parameter name="partyRelationshipId" required="true"/>
+        </in-parameters>
+        <out-parameters><parameter name="partyRelationshipId"/></out-parameters>
+        <actions>
+            <set field="thruDate" from="ec.user.getNowTimestamp()"/>
+            <service-call name="update#mantle.party.PartyRelationship" in-map="context" out-map="context"/>
+        </actions>
+    </service>
+</services>
